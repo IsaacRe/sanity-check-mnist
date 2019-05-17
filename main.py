@@ -5,37 +5,57 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
+import numpy as np
 import pickle
 
 
 class Net(nn.Module):
-    def __init__(self, activation):
+    def __init__(self, args):
         super(Net, self).__init__()
-        self.activation = activation
+        self.activation = F.sigmoid
+        self._mimic = True
         self.conv1 = nn.Conv2d(1, 20, 5, 1)
         self.conv2 = nn.Conv2d(20, 50, 5, 1)
         self.fc1 = nn.Linear(4 * 4 * 50, 500)
         self.fc2 = nn.Linear(500, 10)
 
     def forward(self, x):
-        x = self.activation(self.conv1(x))
-        x = F.max_pool2d(x, 2, 2)
-        x = self.activation(self.conv2(x))
-        x = F.max_pool2d(x, 2, 2)
+        conv_1 = self.activation(self.conv1(x))  # [batch x 20 x 24 x 24]
+        x = F.max_pool2d(conv_1, 2, 2)
+        conv_2 = self.activation(self.conv2(x))  # [batch x 50 x 8 x 8]
+        x = F.max_pool2d(conv_2, 2, 2)
         x = x.view(-1, 4 * 4 * 50)
-        x = self.activation(self.fc1(x))
-        x = self.fc2(x)
-        return F.log_softmax(x, dim=1)
+        fc_1 = self.activation(self.fc1(x))      # [batch x 500]
+        out = self.fc2(fc_1)                     # [batch x 10]
+        if self._mimic:
+            return torch.cat([conv_1.view(-1, 20 * 24 * 24), conv_2.view(-1, 50 * 8 * 8), fc_1], dim=1), out
+        else:
+            return out
+
+    def mimic(self):
+        # Only called on mimicking model
+        self._mimic = True
+
+    def classify(self):
+        # Only called on mimicking model
+        self._mimic = False
 
 
 def train(args, model, device, train_loader, optimizer, epoch):
     model.train()
+    model.classify()  # set model to only output logits
     losses = []
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
-        loss = F.nll_loss(output, target)
+        if args.bce_loss:
+            new_target = torch.zeros((target.shape[0], 10))
+            new_target[np.arange(target.shape[0]), target] = 1.
+            loss = F.binary_cross_entropy_with_logits(output, new_target)
+        else:
+            #loss = F.cross_entropy(output, target)
+            loss = F.nll_loss(F.log_softmax(output, dim=1), target, reduction='sum')  # sum up batch loss
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
@@ -69,17 +89,18 @@ def test(args, model, device, test_loader):
 
 def save_file(args, model):
     # save to different path depending on args
-    path = "mnist_cnn"
-    if args.activation == 'relu':
-        path += '_sigmoid'
+    path = args.experiment_id
     path += '.pt'
-    torch.save(model.state_dict(), save_file)
+    torch.save(model.state_dict(), path)
 
 
 def main():
     parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
-    # My Settings
-    parser.add_argument('--activation', type=str, choices=['relu', 'sigmoid'], default='relu')
+    parser.add_argument('--experiment-id', type=str, default='0')
+    # Mimic Settings
+    parser.add_argument('--mimic', action='store_true')
+    parser.add_argument('--bce-loss', action='store_true',
+                        help='Whether to train output on BCE Loss (both for mimicking and classification)')
     # Training settings
     parser.add_argument('--batch-size', type=int, default=64, metavar='N',
                         help='input batch size for training (default: 64)')
@@ -122,9 +143,7 @@ def main():
         ])),
         batch_size=args.test_batch_size, shuffle=True, **kwargs)
 
-    activation = F.relu if args.activation == 'relu' else F.sigmoid
-
-    model = Net(activation).to(device)
+    model = Net(args).to(device)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
 
     train_losses = []
@@ -136,11 +155,11 @@ def main():
         val_losses += [val_loss]
         val_accuracies += [val_accuracy]
 
-    with open('train-loss.pkl', 'wb+') as f:
+    with open('%s-train-loss.pkl' % args.experiment_id, 'wb+') as f:
         pickle.dump(train_losses, f)
-    with open('val-accuracy.pkl', 'wb+') as f:
+    with open('%s-val-accuracy.pkl' % args.experiment_id, 'wb+') as f:
         pickle.dump(val_accuracies, f)
-    with open('val-loss.pkl', 'wb+') as f:
+    with open('%s-val-loss.pkl' % args.experiment_id, 'wb+') as f:
         pickle.dump(val_loss, f)
 
     if args.save_model:
