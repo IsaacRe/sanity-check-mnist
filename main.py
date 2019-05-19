@@ -9,9 +9,9 @@ import numpy as np
 import pickle
 
 
-class Net(nn.Module):
+class MimicNet(nn.Module):
     def __init__(self, args):
-        super(Net, self).__init__()
+        super(MimicNet, self).__init__()
         self.activation = F.sigmoid
         self._mimic = True
         self.conv1 = nn.Conv2d(1, 20, 5, 1)
@@ -20,30 +20,84 @@ class Net(nn.Module):
         self.fc2 = nn.Linear(500, 10)
 
     def forward(self, x):
-        conv_1 = self.activation(self.conv1(x))  # [batch x 20 x 24 x 24]
-        x = F.max_pool2d(conv_1, 2, 2)
-        conv_2 = self.activation(self.conv2(x))  # [batch x 50 x 8 x 8]
-        x = F.max_pool2d(conv_2, 2, 2)
+        x = self.activation(self.conv1(x))  # [batch x 20 x 24 x 24]
+        conv_1 = x.view(-1, 20 * 24 * 24)
+        x = F.max_pool2d(x, 2, 2)
+        x = self.activation(self.conv2(x))  # [batch x 50 x 8 x 8]
+        conv_2 = x.view(-1, 50 * 8 * 8)
+        x = F.max_pool2d(x, 2, 2)
         x = x.view(-1, 4 * 4 * 50)
-        fc_1 = self.activation(self.fc1(x))      # [batch x 500]
-        out = self.fc2(fc_1)                     # [batch x 10]
+        x = self.activation(self.fc1(x))    # [batch x 500]
+        fc_1 = x
+        out = self.fc2(x)                   # [batch x 10]
         if self._mimic:
             return torch.cat([conv_1.view(-1, 20 * 24 * 24), conv_2.view(-1, 50 * 8 * 8), fc_1], dim=1), out
         else:
             return out
 
     def mimic(self):
-        # Only called on mimicking model
         self._mimic = True
 
     def classify(self):
-        # Only called on mimicking model
         self._mimic = False
+
+
+class Net(nn.Module):
+    def __init__(self, args):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 20, 5, 1)
+        self.conv2 = nn.Conv2d(20, 50, 5, 1)
+        self.fc1 = nn.Linear(4 * 4 * 50, 500)
+        self.fc2 = nn.Linear(500, 10)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.max_pool2d(x, 2, 2)
+        x = F.relu(self.conv2(x))
+        x = F.max_pool2d(x, 2, 2)
+        x = x.view(-1, 4 * 4 * 50)
+        x = F.relu(self.fc1(x))
+        out = self.fc2(x)
+        return out
+
+
+def train_mimic(args, model, mimic_model, device, train_loader, optimizer, epoch):
+    model.train()
+    model.mimic()
+    losses = []
+    for batch_idx, (data, _) in enumerate(train_loader):
+        data = data.to(device)
+        optimizer.zero_grad()
+        with torch.no_grad():
+            target_activations, target_output = mimic_model(data)
+        activations, output = model(data)
+        # get output  loss
+        if args.bce_loss:
+            target_output = F.sigmoid(target_output)
+            output_loss = F.binary_cross_entropy_with_logits(output, target_output)
+        else:
+            # manually compute cross entropy between distributions encoded in logits
+            output = F.log_softmax(output)
+            target_output = F.softmax(target_output)
+            output_loss = -torch.sum(output * target_output) / output.shape[0]
+        loss = output_loss
+        if args.mimic_activations:
+            # get activation loss
+            activation_loss = F.binary_cross_entropy(activations, target_activations)
+            loss += activation_loss
+        loss.backward()
+        optimizer.step()
+        if batch_idx % args.log_interval == 0:
+            losses += [loss.item()]
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                epoch, batch_idx * len(data), len(train_loader.dataset),
+                       100. * batch_idx / len(train_loader), loss.item()))
+    model.classify()
+    return losses
 
 
 def train(args, model, device, train_loader, optimizer, epoch):
     model.train()
-    model.classify()  # set model to only output logits
     losses = []
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
@@ -54,8 +108,7 @@ def train(args, model, device, train_loader, optimizer, epoch):
             new_target[np.arange(target.shape[0]), target] = 1.
             loss = F.binary_cross_entropy_with_logits(output, new_target)
         else:
-            #loss = F.cross_entropy(output, target)
-            loss = F.nll_loss(F.log_softmax(output, dim=1), target, reduction='sum')  # sum up batch loss
+            loss = F.cross_entropy(output, target)
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
@@ -74,6 +127,7 @@ def test(args, model, device, test_loader):
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
             output = model(data)
+            output = F.log_softmax(output, dim=1)
             test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
             pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
@@ -99,6 +153,9 @@ def main():
     parser.add_argument('--experiment-id', type=str, default='0')
     # Mimic Settings
     parser.add_argument('--mimic', action='store_true')
+    parser.add_argument('--only-mimic-output', action='store_false', dest='mimic_activations')
+    parser.add_argument('--mimic-model', type=str, default=None,
+                        help='The model to mimic output of. If none then train on ground truth')
     parser.add_argument('--bce-loss', action='store_true',
                         help='Whether to train output on BCE Loss (both for mimicking and classification)')
     # Training settings
@@ -123,6 +180,8 @@ def main():
                         help='For Saving the current Model')
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
+    if args.mimic_model is not None:
+        assert args.mimic, "Must use MimicModel for mimic training. Pass --mimic"
 
     torch.manual_seed(args.seed)
 
@@ -143,14 +202,25 @@ def main():
         ])),
         batch_size=args.test_batch_size, shuffle=True, **kwargs)
 
-    model = Net(args).to(device)
+    if args.mimic:
+        model = MimicNet(args).to(device)
+    else:
+        model = Net(args).to(device)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+
+    model.classify()
+    if args.mimic_model is not None:
+        mimic_model = MimicNet(args).to(device)
+        mimic_model.load_state_dict(torch.load(args.mimic_model))
 
     train_losses = []
     val_losses = []
     val_accuracies = []
     for epoch in range(1, args.epochs + 1):
-        train_losses += train(args, model, device, train_loader, optimizer, epoch)
+        if args.mimic_model is not None:
+            train_losses += train_mimic(args, model, mimic_model, device, train_loader, optimizer, epoch)
+        else:
+            train_losses += train(args, model, device, train_loader, optimizer, epoch)
         val_loss, val_accuracy = test(args, model, device, test_loader)
         val_losses += [val_loss]
         val_accuracies += [val_accuracy]
@@ -160,7 +230,7 @@ def main():
     with open('%s-val-accuracy.pkl' % args.experiment_id, 'wb+') as f:
         pickle.dump(val_accuracies, f)
     with open('%s-val-loss.pkl' % args.experiment_id, 'wb+') as f:
-        pickle.dump(val_loss, f)
+        pickle.dump(val_losses, f)
 
     if args.save_model:
         save_file(args, model)
