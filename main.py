@@ -12,7 +12,10 @@ import pickle
 class MimicNet(nn.Module):
     def __init__(self, args):
         super(MimicNet, self).__init__()
-        self.activation = F.sigmoid
+        try:
+            self.activation = F.__dict__[args.activation]
+        except KeyError:
+            raise KeyError('torch functional module doesnt implement the specified activation')
         self._mimic = True
         self.conv1 = nn.Conv2d(1, 20, 5, 1)
         self.conv2 = nn.Conv2d(20, 50, 5, 1)
@@ -20,16 +23,19 @@ class MimicNet(nn.Module):
         self.fc2 = nn.Linear(500, 10)
 
     def forward(self, x):
-        x = self.activation(self.conv1(x))  # [batch x 20 x 24 x 24]
+        x = self.conv1(x)  # [batch x 20 x 24 x 24]
         conv_1 = x.view(-1, 20 * 24 * 24)
+        x = self.activation(x)
         x = F.max_pool2d(x, 2, 2)
-        x = self.activation(self.conv2(x))  # [batch x 50 x 8 x 8]
+        x = self.conv2(x)  # [batch x 50 x 8 x 8]
         conv_2 = x.view(-1, 50 * 8 * 8)
+        x = self.activation(x)
         x = F.max_pool2d(x, 2, 2)
         x = x.view(-1, 4 * 4 * 50)
-        x = self.activation(self.fc1(x))    # [batch x 500]
+        x = self.fc1(x)    # [batch x 500]
         fc_1 = x
-        out = self.fc2(x)                   # [batch x 10]
+        x = self.activation(x)
+        out = self.fc2(x)  # [batch x 10]
         if self._mimic:
             return torch.cat([conv_1.view(-1, 20 * 24 * 24), conv_2.view(-1, 50 * 8 * 8), fc_1], dim=1), out
         else:
@@ -61,11 +67,19 @@ class Net(nn.Module):
         return out
 
 
-def train_mimic(args, model, mimic_model, device, train_loader, optimizer, epoch):
+val_accs = []
+val_losses = []
+
+
+def train_mimic(args, model, mimic_model, device, train_loader, test_loader, optimizer, epoch):
     model.train()
     model.mimic()
     losses = []
     for batch_idx, (data, _) in enumerate(train_loader):
+        if batch_idx % args.test_freq == 0:
+            model.classify()
+            test(args, model, device, test_loader)
+            model.mimic()
         data = data.to(device)
         optimizer.zero_grad()
         with torch.no_grad():
@@ -83,7 +97,12 @@ def train_mimic(args, model, mimic_model, device, train_loader, optimizer, epoch
         loss = output_loss
         if args.mimic_activations:
             # get activation loss
-            activation_loss = F.binary_cross_entropy(activations, target_activations)
+            if args.mse_loss:
+                activation_loss = F.mse_loss(activations, target_activations)
+            else:
+                activations = F.sigmoid(activations)
+                target_activations = F.sigmoid(target_activations)
+                activation_loss = F.binary_cross_entropy(activations, target_activations)
             loss += activation_loss
         loss.backward()
         optimizer.step()
@@ -96,10 +115,16 @@ def train_mimic(args, model, mimic_model, device, train_loader, optimizer, epoch
     return losses
 
 
-def train(args, model, device, train_loader, optimizer, epoch):
+batch_idx = 0
+
+
+def train(args, model, device, train_loader, test_loader, optimizer, epoch):
+    global batch_idx
     model.train()
     losses = []
-    for batch_idx, (data, target) in enumerate(train_loader):
+    for _, (data, target) in enumerate(train_loader):
+        if args.test_freq is not None and batch_idx % args.test_freq == 0:
+            test(args, model, device, test_loader)
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
@@ -116,10 +141,12 @@ def train(args, model, device, train_loader, optimizer, epoch):
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                        100. * batch_idx / len(train_loader), loss.item()))
+        batch_idx += 1
     return losses
 
 
 def test(args, model, device, test_loader):
+    global val_accs, val_losses
     model.eval()
     test_loss = 0
     correct = 0
@@ -133,31 +160,41 @@ def test(args, model, device, test_loader):
             correct += pred.eq(target.view_as(pred)).sum().item()
 
     test_loss /= len(test_loader.dataset)
+    test_acc = 100. * correct / len(test_loader.dataset)
+
+    val_accs += [test_acc]
+    val_losses += [test_loss]
 
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-        test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
+        test_loss, correct, len(test_loader.dataset), test_acc))
 
-    return test_loss, 100. * correct / len(test_loader.dataset)
+    model.train()
+    return test_loss, test_acc
 
 
 def save_file(args, model):
     # save to different path depending on args
-    path = args.experiment_id
-    path += '.pt'
+    path = args.experiment_id + '/' + args.experiment_id + '.pt'
     torch.save(model.state_dict(), path)
 
 
 def main():
+    global val_accs, val_losses
     parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
     parser.add_argument('--experiment-id', type=str, default='0')
     # Mimic Settings
-    parser.add_argument('--mimic', action='store_true')
+    parser.add_argument('--activation', type=str, choices=['relu', 'sigmoid'], default='relu')
+    parser.add_argument('--mse-loss', action='store_true', help='Formulate MSE Loss on activations? Otherwise'
+                                                                'loss is formulated from passing raw layer output'
+                                                                'through a sigmoid')
+    parser.add_argument('--baseline', action='store_false', dest='mimic')
     parser.add_argument('--only-mimic-output', action='store_false', dest='mimic_activations')
     parser.add_argument('--mimic-model', type=str, default=None,
                         help='The model to mimic output of. If none then train on ground truth')
     parser.add_argument('--bce-loss', action='store_true',
                         help='Whether to train output on BCE Loss (both for mimicking and classification)')
+    # Statistics settings
+    parser.add_argument('--test-freq', type=int, default=None, help="Frequency of validating training model")
     # Training settings
     parser.add_argument('--batch-size', type=int, default=64, metavar='N',
                         help='input batch size for training (default: 64)')
@@ -214,22 +251,21 @@ def main():
         mimic_model.load_state_dict(torch.load(args.mimic_model))
 
     train_losses = []
-    val_losses = []
-    val_accuracies = []
     for epoch in range(1, args.epochs + 1):
         if args.mimic_model is not None:
-            train_losses += train_mimic(args, model, mimic_model, device, train_loader, optimizer, epoch)
+            train_losses += train_mimic(args, model, mimic_model, device, train_loader, test_loader, optimizer, epoch)
         else:
-            train_losses += train(args, model, device, train_loader, optimizer, epoch)
-        val_loss, val_accuracy = test(args, model, device, test_loader)
-        val_losses += [val_loss]
-        val_accuracies += [val_accuracy]
+            train_losses += train(args, model, device, train_loader, test_loader, optimizer, epoch)
+        if args.test_freq is None:
+            val_loss, val_accuracy = test(args, model, device, test_loader)
+            val_losses += [val_loss]
+            val_accs += [val_accuracy]
 
-    with open('%s-train-loss.pkl' % args.experiment_id, 'wb+') as f:
+    with open('%s/%s-train-loss.pkl' % (args.experiment_id, args.experiment_id), 'wb+') as f:
         pickle.dump(train_losses, f)
-    with open('%s-val-accuracy.pkl' % args.experiment_id, 'wb+') as f:
-        pickle.dump(val_accuracies, f)
-    with open('%s-val-loss.pkl' % args.experiment_id, 'wb+') as f:
+    with open('%s/%s-val-accuracy.pkl' % (args.experiment_id, args.experiment_id), 'wb+') as f:
+        pickle.dump(val_accs, f)
+    with open('%s/%s-val-loss.pkl' % (args.experiment_id, args.experiment_id), 'wb+') as f:
         pickle.dump(val_losses, f)
 
     if args.save_model:
